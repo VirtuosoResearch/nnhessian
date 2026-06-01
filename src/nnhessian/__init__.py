@@ -1,1 +1,1 @@
-from nnhessian.calculator import NNHessianCalculator
+from nnhessian.hessian import NNHessianCalculator
