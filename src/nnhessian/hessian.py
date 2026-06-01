@@ -7,9 +7,94 @@ import math
 import re
 from fnmatch import fnmatch
 
-from nnhessian.utils import print_gpu_utilization, plot_curves, sqrt_sum_nonnegative
 
 ParamSelector = Union[str, re.Pattern, Callable[[str, nn.Parameter], bool], nn.Parameter]
+
+
+def lanczos_tridiag(hvp_fn: Callable, v0: torch.Tensor, n_iter: int) -> np.ndarray:
+    """
+    Run n_iter steps of the Lanczos 3-term recurrence starting from unit vector v0.
+
+    Args:
+        hvp_fn: callable v -> H v (returns a CPU tensor of the same shape as v).
+        v0: starting vector (need not be unit-norm).
+        n_iter: number of Lanczos steps.
+
+    Returns:
+        T: symmetric tridiagonal numpy array of shape (n_iter, n_iter).
+    """
+    alpha = np.zeros(n_iter)
+    beta  = np.zeros(n_iter - 1)
+
+    v_prev = torch.zeros_like(v0)
+    v = v0 / v0.norm()
+    b = 0.0
+
+    for j in range(n_iter):
+        Hv = hvp_fn(v)
+        a  = torch.dot(Hv, v).item()
+        alpha[j] = a
+        r = Hv - a * v - b * v_prev
+
+        if j < n_iter - 1:
+            b = r.norm().item()
+            beta[j] = b
+            if b > 1e-10:
+                v_next = r / b
+            else:
+                # Near-happy breakdown: restart orthogonal to current direction
+                v_next = torch.randn_like(v)
+                v_next = v_next - v * torch.dot(v_next, v)
+                nrm = v_next.norm()
+                v_next = v_next / nrm if nrm > 1e-10 else torch.zeros_like(v)
+            v_prev, v = v, v_next
+
+    return np.diag(alpha) + np.diag(beta, 1) + np.diag(beta, -1)
+
+
+def slq_estimate(
+    hvp_fn: Callable,
+    d: int,
+    n_v: int,
+    n_iter: int,
+    deflate_Q: Optional[torch.Tensor] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Stochastic Lanczos Quadrature spectral density estimator.
+
+    Args:
+        hvp_fn: callable v -> H v (1-D CPU tensor in, 1-D CPU tensor out).
+        d: parameter-space dimension.
+        n_v: number of random probe vectors.
+        n_iter: Lanczos steps per probe.
+        deflate_Q: optional (d, s) orthonormal matrix. When provided each probe
+                   is projected out of span(deflate_Q) before running Lanczos,
+                   targeting the residual spectrum.
+
+    Returns:
+        values:  (n_valid * n_iter,) Ritz values.
+        weights: (n_valid * n_iter,) quadrature weights, averaged over probes
+                 so the total sums to ≈ 1.
+    """
+    all_eigs, all_weights = [], []
+    for _ in range(n_v):
+        v = torch.randn(d)
+        if deflate_Q is not None:
+            v = v - deflate_Q @ (deflate_Q.t() @ v)
+            nrm = v.norm()
+            if nrm < 1e-10:
+                continue
+            v = v / nrm
+        else:
+            v = v / v.norm()
+
+        T = lanczos_tridiag(hvp_fn, v, n_iter)
+        eigs, U = np.linalg.eigh(T)
+        all_eigs.append(eigs)
+        all_weights.append(U[0] ** 2)
+
+    n_valid = max(len(all_eigs), 1)
+    return np.concatenate(all_eigs), np.concatenate(all_weights) / n_valid
 
 
 class NNHessianCalculator():
@@ -240,169 +325,6 @@ class NNHessianCalculator():
                 total_samples += batch_size
         return total_loss / total_samples
 
-    def evaluate_hutch(self, model, dataloader, loss_fn, noise_vector=None, device='cpu'):
-        model.train()
-        total_loss = 0.0
-        total_hutch = 0.0
-        total_max_eig = 0.0
-        count = 0
-        with sdpa_kernel(SDPBackend.MATH):
-            for batch in dataloader:
-                data, target, batch_size = self.load_batch_func(batch, device)
-                output = model(data)
-                loss = loss_fn(output, target)
-                total_loss += loss.item() * batch_size
-                count += batch_size
-
-                # Generate a noise vector matching the flattened parameters.
-                if noise_vector is None:
-                    flat_params = torch.cat([p.detach().view(-1) for p in model.parameters()])
-                    noise_vector = torch.randn_like(flat_params)
-
-                # Hutchinson estimator: v^T H v
-                hessian_quad = self.hessian_quadratic_form(model, loss, noise_vector)
-                hessian_quad = hessian_quad.item()
-                total_hutch += hessian_quad * batch_size
-
-        avg_loss = total_loss / count if count > 0 else 0.0
-        avg_hutch = total_hutch / count if count > 0 else 0.0
-        return avg_loss, avg_hutch
-
-    def evaluate_max_eigenvalue(self, model, dataloader, loss_fn, device='cpu'):
-        model.train()
-        total_max_eig = 0.0
-        count = 0
-
-        with sdpa_kernel(SDPBackend.MATH):
-            for batch in dataloader:
-                data, target, batch_size = self.load_batch_func(batch, device)
-                output = model(data)
-                loss = loss_fn(output, target)
-                count += batch_size
-
-                # Compute the largest eigenvalue of the Hessian.
-                max_eig = self.approximate_lambda_max(loss, model, power_iter=100)
-                total_max_eig += max_eig * batch_size
-
-        avg_max_eig = total_max_eig / count if count > 0 else 0.0
-        return avg_max_eig
-
-    ##############################################
-    # Main algorithm 1: stochastic lanczos quadrature
-    ##############################################
-
-    def get_train_spectrum(self, n_v, n_iter):
-        if self.train_weights is None or self.train_values is None:
-            self.train_values, self.train_weights = self.get_full_spectrum(n_v, n_iter, self.dataloader)
-        return self.train_values, self.train_weights
-
-    def get_valid_spectrum(self, n_v, n_iter):
-        if self.valid_weights is None or self.valid_values is None:
-            self.valid_values, self.valid_weights = self.get_full_spectrum(n_v, n_iter, self.valid_dataloader)
-        return self.valid_values, self.valid_weights
-
-    def get_full_spectrum(self, n_v, n_iter, dataloader=None):
-        weights = np.zeros((n_v, n_iter))
-        values = np.zeros((n_v, n_iter))
-
-        for k in range(n_v):
-            'wiki version'
-            T = self.tridiagonalize_by_lanzcos(n_iter, k, dataloader)
-            eigenvalues, U  = np.linalg.eigh(T)
-            values[k,:] = eigenvalues
-            weights[k,:] = U[0]**2
-            if k == 0:
-                print_gpu_utilization()
-
-        all_values = np.concatenate(values)
-        all_weights = np.concatenate(weights)
-        return all_values, all_weights
-
-        grid, curve = self.interpolate(weights, values)
-
-    def tridiagonalize_by_lanzcos(self, n_iter, k, dataloader=None):
-        'set up'
-        v_list = []
-        T = np.zeros((n_iter, n_iter), dtype= np.float64)
-
-        'initialization'
-        v = torch.randn(self.total_params, dtype = torch.float64)
-        v /= torch.norm(v)
-        v_list.append(v.cpu())
-
-        w_prime = self.hessian_vector_product_with_tensor_input(v_list[-1], dataloader)
-        'orthogonalize wprime'
-        alpha = torch.sum(w_prime * v_list[-1])
-        w = w_prime - alpha * v_list[-1]
-        T[0, 0] = alpha
-
-        'iteration'
-        for j in range(1, n_iter):
-            beta = torch.norm(w)
-            if beta >1e-8:
-                v_list.append(w / beta)
-
-            else:
-                v_list.append(w / 1e-8)
-
-                if len(v_list) > 2:
-                    del v_list[0]  # keep this list short to save memory
-
-            w_prime = self.hessian_vector_product_with_tensor_input(v_list[-1], dataloader)
-            alpha = torch.sum(w_prime* v_list[-1])
-            w = w_prime - alpha * v_list[-1] - beta * v_list[-2]
-            T[j, j] = alpha
-            T[j-1, j ] = beta
-            T[j , j-1] = beta
-
-        return  T
-
-    def hessian_vector_product_with_tensor_input(self, d_tensor, dataloader=None):
-        'comput hessian_vector product, takes a flattened tensors as input (with shape (total parameters, ) )'
-        d_tensor = d_tensor.cuda()
-        self.model.eval()
-        self.model.zero_grad(set_to_none = True)
-        total_hd_tensor = 0
-
-        t_hd = time.time()
-        for batch in dataloader:
-            # Specific data process, in order to fit the loss input
-            data, target, batch_size = self.load_batch_func(batch, self.device)
-            if self.lino_sigma == 0:
-                output = self.model(data)
-            else:
-                output = self.model(data, embed_noise=True, sigma=self.lino_sigma, method='rule_noise')
-            loss = self.loss_fn(output, target, 'mean')
-
-            loss.backward(create_graph= True)
-            g_list = []
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    g_list.append(torch.flatten(param.grad.double()))
-
-            g_tensor = torch.cat(g_list, dim = 0)
-
-            self.model.zero_grad(set_to_none = True)
-            g_tensor = g_tensor.cuda()
-            l = torch.sum(g_tensor*d_tensor)
-            l.backward(retain_graph = True)
-
-            hd_list = []
-            for name, param in self.model.named_parameters():
-                if param.requires_grad:
-                    hd_list.append(torch.flatten(param.grad.double().data.clone()))
-
-            hd_tensor = torch.cat(hd_list, dim = 0)
-            self.model.zero_grad(set_to_none = True)
-            hd_tensor = hd_tensor.cpu()
-            total_hd_tensor += hd_tensor * batch_size
-
-        total_hd_tensor /= len(dataloader.dataset)
-        return total_hd_tensor
-
-    ##############################################
-    # Main algorithm 2: Hutchinson's Method
-    ##############################################
     def hutchinson_trace(self, num_samples: int = 50, distribution: str = "rademacher",
                      dataloader=None, seed: int = None, return_std: bool = False):
         """
@@ -472,6 +394,59 @@ class NNHessianCalculator():
             return mean_est, std, stderr
 
         return mean_est
+
+    def slq_spectrum(
+        self, n_v: int, n_iter: int, dataloader=None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Estimate the Hessian spectral density via Stochastic Lanczos Quadrature.
+
+        Args:
+            n_v: number of random probe vectors.
+            n_iter: Lanczos steps per probe.  Total HVP cost: n_v * n_iter.
+            dataloader: optional override of self.dataloader.
+
+        Returns:
+            values:  (n_v * n_iter,) Ritz values.
+            weights: (n_v * n_iter,) quadrature weights (sum ≈ 1).
+        """
+        if dataloader is None:
+            if self.dataloader is None:
+                raise ValueError("No dataloader provided.")
+            dataloader = self.dataloader
+
+        hvp_fn = lambda v: self._hessian_vector_product(v, dataloader=dataloader)
+        return slq_estimate(hvp_fn, self.total_params, n_v, n_iter)
+
+    def deflated_slq_spectrum(
+        self, n_v: int, n_iter: int, s: int, dataloader=None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if dataloader is None:
+            if self.dataloader is None:
+                raise ValueError("No dataloader provided.")
+            dataloader = self.dataloader
+
+        d = self.total_params
+        hvp_fn = lambda v: self._hessian_vector_product(v, dataloader=dataloader)
+
+        S  = torch.randn(d, s)
+        Y  = torch.stack([hvp_fn(S[:, i]) for i in range(s)], dim=1)
+        Q, _ = torch.linalg.qr(Y, mode='reduced')                   # (d, s)
+        HQ   = torch.stack([hvp_fn(Q[:, i]) for i in range(s)], dim=1)
+        QTHQ = Q.t() @ HQ                                            # (s, s)
+        large_eigs = torch.linalg.eigvalsh(QTHQ).numpy()
+
+        def deflated_hvp(v, _Q=Q, _HQ=HQ, _QTHQ=QTHQ):
+            Hv   = hvp_fn(v)
+            QTv  = _Q.t() @ v
+            QTHv = _Q.t() @ Hv
+            return Hv - _HQ @ QTv - _Q @ QTHv + _Q @ (_QTHQ @ QTv)
+
+        slq_vals, slq_wts = slq_estimate(deflated_hvp, d, n_v, n_iter, deflate_Q=Q)
+
+        all_vals = np.concatenate([large_eigs, slq_vals])
+        all_wts  = np.concatenate([np.ones(s) / d, slq_wts * (d - s) / d])
+        return all_vals, all_wts
 
     def max_eigenvalue_power(self, num_iters: int = 50, tol: float = 1e-5,
                          dataloader=None, init_vec: torch.Tensor = None,
@@ -650,215 +625,3 @@ class NNHessianCalculator():
         trace_estimate = term1 + term2
 
         return trace_estimate
-
-    def check_hutch_pp(self, logger, log_i, train_num, valid_num, m=100):
-        with sdpa_kernel(SDPBackend.MATH):
-            device = self.device
-            model = self.model
-            loss_fn = self.loss_fn
-            loss = 0
-            hutch_pp_list = []
-
-            start_time = time.time()
-            for batch in self.dataloader:
-                data, target, batch_size = self.load_batch_func(batch, device)
-                output = model(data)
-                loss = loss_fn(output, target, 'mean')
-                trace_estimate = self.hutch_pp_trace_estimator(model, loss, m)
-                hutch_pp_list.append(trace_estimate.item() * batch_size)
-            trace_estimate = sum(hutch_pp_list) / train_num
-            logger.log("trace_estimate", trace_estimate, log_i)
-            logger.log("hutch_pp_time", time.time() - start_time, log_i)
-
-            sample_num = 100
-            train_hessian_list = []
-            train_hessian_2_list = []
-
-            start_time = time.time()
-            for i in range(sample_num):
-                noise_vector = None
-                train_hessian = 0
-                train_hessian_2 = 0
-                for train_batch in self.dataloader:
-                    data, target, batch_size = self.load_batch_func(train_batch, device)
-                    output = model(data)
-                    loss = loss_fn(output, target)
-
-                    # Compute gradients to get the shape.
-                    if noise_vector is None:
-                        grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
-                        grad_vector = torch.cat([g.reshape(-1) for g in grads])
-
-                        # Sample the noise vector once.
-                        noise_vector = torch.randint_like(grad_vector, high=2)
-                        noise_vector[noise_vector == 0] = -1
-                    train_quad = self.hessian_quadratic_form(model, loss, noise_vector)
-
-                    train_hessian += train_quad.item()*batch_size
-
-                train_hessian /= train_num
-
-                noise_vector = None
-                train_hessian_list.append(train_hessian)
-
-            train_hessian = np.mean(train_hessian_list)
-
-            logger.log("train_hessian", train_hessian, log_i)
-            logger.log("hutch_time", time.time() - start_time, log_i)
-            plot_curves(logger, ['trace_estimate', 'train_hessian'], path_name='check', file_name='hutch_pp')
-            plot_curves(logger, ['hutch_pp_time', 'hutch_time'], path_name='check', file_name='time')
-
-    ##############################################
-    # Usage
-    ##############################################
-
-    def check_slq(self, logger, i, train_num, valid_num, n_iter=100, n_v=1):
-        with sdpa_kernel(SDPBackend.MATH):
-            print("=======> SLQ for full model")
-            values_full, weights_full = self.get_train_spectrum(n_v, n_iter)
-            self.values_full = values_full.tolist()
-            self.weights_full = weights_full.tolist()
-            d = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            self.slq_H_trace = np.sum(values_full * weights_full) * d
-            self.slq_H2_trace = np.sum(values_full**2 * weights_full)* d
-            self.hvp_H_trace, self.hvp_H2_trace, _, _ = self.compare_hessian(logger, i, train_num, valid_num)
-            print(self.slq_H_trace, self.slq_H2_trace, self.hvp_H_trace)
-            slq_lambda_max = max(values_full)
-
-            device = self.device
-            model = self.model
-            loss_fn = self.loss_fn
-
-            train_lambda_max = 0
-            for batch in self.dataloader:
-                data, target, batch_size = self.load_batch_func(batch, device)
-                output = model(data)
-                loss = loss_fn(output, target, 'none')
-                model.zero_grad()
-
-                batch_lambda_max = self.approximate_lambda_max(loss.mean(), model, power_iter=100)
-                train_lambda_max += batch_lambda_max * batch_size
-            train_lambda_max /= len(self.dataloader.dataset)
-
-        logger.log("slq_H_trace", self.slq_H_trace, i)
-        logger.log("slq_H2_trace", self.slq_H2_trace, i)
-        logger.log("hvp_H_trace", self.hvp_H_trace, i)
-        logger.log("hvp_H2_trace", self.hvp_H2_trace, i)
-        data_names = ['slq_H_trace', 'hvp_H_trace']
-        plot_curves(logger, data_names, path_name='check', file_name='hessian')
-        data_names = ['slq_H2_trace', 'hvp_H2_trace']
-        plot_curves(logger, data_names, path_name='check', file_name='hessian_2')
-
-        logger.log("hvp_lambda_max", train_lambda_max, i)
-        logger.log("slq_lambda_max", slq_lambda_max, i)
-        plot_curves(logger, ['hvp_lambda_max', 'slq_lambda_max'], path_name='check', file_name='lambda_max')
-
-
-def compute_eigenvalue(model, loss, device, maxIter=100, tol=1e-10, top_n=1):
-    model.zero_grad()
-    gradients = torch.autograd.grad(loss, model.parameters(), retain_graph=True, create_graph=True)
-
-    topn_eigenvalues = []
-    eigenvectors = []
-    computed_dim = 0
-    while computed_dim < top_n:
-
-        eigenvalues = None
-        # Compute gradients with respect to model parameters.
-        grads = torch.autograd.grad(loss, model.parameters(), create_graph=True)
-        grad_vector = torch.cat([g.reshape(-1) for g in grads])
-
-        v = torch.randn_like(grad_vector)
-        v = v / torch.norm(v)
-
-        # Compute the dot product between gradients and noise vector.
-        grad_dot_noise = torch.dot(grad_vector, v)
-
-        # Compute Hessian-vector product using the Pearlmutter trick.
-        Hv = torch.autograd.grad(grad_dot_noise, model.parameters(), retain_graph=True)
-
-        for _ in range(maxIter):
-            vs = orthnormal(vs, eigenvectors)
-            model.zero_grad()
-
-            Hvs = torch.autograd.grad(grad_dot_noise, model.parameters(), retain_graph=True)
-            tmp_eigenvalues = torch.sum(Hv*v).cpu().item()
-
-            vs = normalization(Hvs)
-
-            if eigenvalues == None:
-                eigenvalues = tmp_eigenvalues
-            else:
-                if abs(sum(eigenvalues) - sum(tmp_eigenvalues)) / (abs(sum(eigenvalues)) +
-                                                        1e-6) < tol:
-                    break
-                else:
-                    eigenvalues = tmp_eigenvalues
-        topn_eigenvalues.append(eigenvalues)
-        eigenvectors.append(vs)
-        computed_dim += 1
-
-    return topn_eigenvalues, eigenvectors
-
-def compute_layer_eigenvalue(model, loss, device, maxIter=100, tol=1e-10, top_n=1):
-    model.zero_grad()
-    layers = model.get_layers()
-    weights = [module.weight for name, module in layers.items()]
-
-    model.zero_grad()
-    gradients = torch.autograd.grad(loss, weights, retain_graph=True, create_graph=True)
-
-    topn_eigenvalues = []
-    eigenvectors = []
-    computed_dim = 0
-    while computed_dim < top_n:
-
-        eigenvalues = None
-        vs = [torch.randn_like(weight) for weight in weights]  # generate random vector
-        vs = normalization(vs)  # normalize the vector
-
-        for _ in range(maxIter):
-            vs = orthnormal(vs, eigenvectors)
-            model.zero_grad()
-
-            Hvs = torch.autograd.grad(gradients, weights, grad_outputs=vs, retain_graph=True)
-            tmp_eigenvalues = [ torch.sum(Hv*v).cpu().item() for (Hv, v) in zip(Hvs, vs)]
-
-            vs = normalization(Hvs)
-
-            if eigenvalues == None:
-                eigenvalues = tmp_eigenvalues
-            else:
-                if abs(sum(eigenvalues) - sum(tmp_eigenvalues)) / (abs(sum(eigenvalues)) +
-                                                        1e-6) < tol:
-                    break
-                else:
-                    eigenvalues = tmp_eigenvalues
-        topn_eigenvalues.append(eigenvalues)
-        eigenvectors.append(vs)
-        computed_dim += 1
-
-    return topn_eigenvalues, eigenvectors
-
-
-def compute_hessians_quantity(model, loss, device="cpu", state_dict=None):
-    # Get parameters and gradients of corresponding layer
-    with sdpa_kernel(SDPBackend.MATH):
-        layers = model.get_layers()
-        weights = [module.weight for name, module in layers.items()]
-        model.zero_grad()
-        gradients = torch.autograd.grad(loss, weights, retain_graph=True, create_graph=True, allow_unused=True)
-        vs = []
-        for name, module in layers.items():
-            weight = module.weight
-            v = weight.detach().clone() - model.init_state[name+".weight"].to(weight.device)
-            vs.append(v)
-
-        model.zero_grad()
-        Hvs = torch.autograd.grad(gradients, weights, grad_outputs=vs, retain_graph=True)
-
-        layer_hessian_quantities = [torch.sum(Hv*v).cpu().item() for (Hv, v) in zip(Hvs, vs)]
-
-        out = np.array(layer_hessian_quantities)
-        value = sqrt_sum_nonnegative(out)
-    return value

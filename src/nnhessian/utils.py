@@ -5,6 +5,19 @@ import numpy as np
 import math
 
 
+def kde_density(
+    values: np.ndarray,
+    weights: np.ndarray,
+    grid: np.ndarray,
+    sigma: float,
+) -> np.ndarray:
+    """Weighted Gaussian KDE of a spectral density estimate evaluated on a 1-D grid."""
+    density = np.zeros_like(grid, dtype=float)
+    for v, w in zip(values, weights):
+        density += w * np.exp(-0.5 * ((grid - v) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+    return density
+
+
 def print_gpu_utilization():
     nvmlInit()
     memory = 0

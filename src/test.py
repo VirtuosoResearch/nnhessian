@@ -1,24 +1,10 @@
-"""
-Compare Hutchinson trace estimator vs Hutch++ at equal HVP query budgets.
-
-Both methods estimate Tr(H) of the loss Hessian w.r.t. model parameters.
-- hutchinson_trace(num_samples=m): uses m random probe vectors
-- hutch_pp_trace_estimator(m):    uses m HVPs but allocates them more carefully
-
-Ground truth is computed by applying H to each standard basis vector (d HVP calls),
-feasible only for small models. We report mean estimate, absolute error, std, and
-relative error across n_runs independent trials at each budget.
-
-Note: Hutch++ requires m ≡ 2 (mod 4) due to its internal split s=(m+2)//4, g=(m-2)//2.
-"""
-
 import time
 import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 
-from nnhessian.hessian import NNHessianCalculator
+from nnhessian.hessian import NNHessianCalculator, lanczos_tridiag, slq_estimate
 
 
 class TinyMLP(nn.Module):
@@ -167,85 +153,26 @@ def _report(method, m, estimates, times, gt):
     print(f"{m:<8} {method:<12} {mean:<14.4f} {err:<12.4f} {std:<12.4f} {rel:<10.4f} {time_str:>10}")
 
 
-##############################################################
-# Deflated SLQ: Hutch++ idea applied to spectrum estimation
-##############################################################
-
-def lanczos_tridiag(hvp_fn, v0, n_iter):
+def w1_distance(vals_p, wts_p, vals_q, wts_q):
     """
-    n_iter steps of the Lanczos 3-term recurrence starting from unit vector v0.
-    Returns a symmetric tridiagonal matrix T as a numpy array of shape (n_iter, n_iter).
+    Wasserstein-1 distance between two 1D discrete distributions p and q.
+
+    Equals ∫|F_p(t) − F_q(t)| dt — the L1 norm of the CDF difference.
+    This is the natural KDE-free L1 metric for comparing spectral densities:
+    no bandwidth or binning parameters, exact computation.
+
+    Both weight arrays must sum to 1 (or the same constant).
     """
-    alpha = np.zeros(n_iter)
-    beta = np.zeros(n_iter - 1)
-
-    v_prev = torch.zeros_like(v0)
-    v = v0 / v0.norm()
-    b = 0.0  # β_1 = 0 by convention
-
-    for j in range(n_iter):
-        Hv = hvp_fn(v)
-        a = torch.dot(Hv, v).item()
-        alpha[j] = a
-        r = Hv - a * v - b * v_prev
-
-        if j < n_iter - 1:
-            b = r.norm().item()
-            beta[j] = b
-            if b > 1e-10:
-                v_next = r / b
-            else:
-                # Near-happy breakdown: restart with a vector orthogonal to current v
-                v_next = torch.randn_like(v)
-                v_next = v_next - v * torch.dot(v_next, v)
-                norm = v_next.norm()
-                v_next = v_next / norm if norm > 1e-10 else torch.zeros_like(v)
-            v_prev, v = v, v_next
-
-    return np.diag(alpha) + np.diag(beta, 1) + np.diag(beta, -1)
+    x   = np.concatenate([vals_p, vals_q])
+    sgn = np.concatenate([wts_p, -wts_q])
+    idx = np.argsort(x, kind="stable")
+    x, sgn = x[idx], sgn[idx]
+    cdf_diff = np.cumsum(sgn)
+    return float(np.sum(np.abs(cdf_diff[:-1]) * np.diff(x)))
 
 
-def slq_estimate(hvp_fn, d, n_v, n_iter, deflate_Q=None):
-    """
-    Estimate the spectral density via SLQ.
-    Returns (values, weights) with total weight ≈ 1.
-
-    deflate_Q: optional (d, s) orthonormal matrix. If given, each probe vector
-               is projected out of span(deflate_Q) before running Lanczos,
-               so the estimate targets the residual (deflated) spectrum.
-    """
-    all_eigs, all_weights = [], []
-    for _ in range(n_v):
-        v = torch.randn(d)
-        if deflate_Q is not None:
-            v = v - deflate_Q @ (deflate_Q.t() @ v)
-            norm = v.norm()
-            if norm < 1e-10:
-                continue
-            v = v / norm
-        else:
-            v = v / v.norm()
-
-        T = lanczos_tridiag(hvp_fn, v, n_iter)
-        eigs, U = np.linalg.eigh(T)
-        all_eigs.append(eigs)
-        all_weights.append(U[0] ** 2)
-
-    n_valid = max(len(all_eigs), 1)
-    # Average over probes so total weight ≈ 1 (each probe's weights sum to 1)
-    return np.concatenate(all_eigs), np.concatenate(all_weights) / n_valid
-
-
-def kde_density(values, weights, grid, sigma):
-    """Weighted Gaussian KDE evaluated on grid."""
-    density = np.zeros_like(grid, dtype=float)
-    for v, w in zip(values, weights):
-        density += w * np.exp(-0.5 * ((grid - v) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
-    return density
-
-
-def _deflated_slq_l1(calc, d, exact_density, grid, sigma, dx, s, n_v, n_iter):
-    """Single trial of deflated SLQ; returns L1 error against exact_density."""
+def _deflated_slq_l1(calc, d, exact_eigs, s, n_v, n_iter):
+    """Single trial of deflated SLQ; returns W1 error against exact eigenvalues."""
     # Phase 1: build Q ≈ top-s eigenspace (s HVPs), compute HQ (s more HVPs)
     S = torch.randn(d, s)
     Y = torch.stack([calc._hessian_vector_product(S[:, i]) for i in range(s)], dim=1)
@@ -254,38 +181,22 @@ def _deflated_slq_l1(calc, d, exact_density, grid, sigma, dx, s, n_v, n_iter):
     QTHQ = Q.t() @ HQ                                             # (s, s)
     large_eigs = torch.linalg.eigvalsh(QTHQ).numpy()
 
-    # Deflated HVP: H'v = (I−QQᵀ)H(I−QQᵀ)v
-    #             = Hv − HQ(Qᵀv) − Q(QᵀHv) + Q(QᵀHQ Qᵀv)
     def deflated_hvp(v):
         Hv = calc._hessian_vector_product(v)
         QTv  = Q.t() @ v
         QTHv = Q.t() @ Hv
         return Hv - HQ @ QTv - Q @ QTHv + Q @ (QTHQ @ QTv)
 
-    # Phase 2: SLQ on deflated operator with probes projected out of span(Q)
     slq_vals, slq_wts = slq_estimate(deflated_hvp, d, n_v, n_iter, deflate_Q=Q)
 
-    # Combine: large part contributes s/d, deflated SLQ part contributes (d-s)/d
     all_vals = np.concatenate([large_eigs, slq_vals])
     all_wts  = np.concatenate([np.ones(s) / d, slq_wts * (d - s) / d])
-    density = kde_density(all_vals, all_wts, grid, sigma)
-    return np.sum(np.abs(density - exact_density)) * dx
+    return w1_distance(all_vals, all_wts, exact_eigs, np.ones(len(exact_eigs)) / len(exact_eigs))
 
 
 def run_slq_experiment(n_runs=8, n_iter=10,
                        budgets=(60, 120, 200),
                        s_values=(5, 10)):
-    """
-    Sweep over HVP budgets and subspace sizes s to compare standard SLQ vs
-    deflated SLQ (Hutch++-SLQ) for spectral density estimation.
-
-    Budget allocation:
-      Standard SLQ:  n_v = budget // n_iter probes
-      Deflated SLQ:  2s setup HVPs + n_v' = (budget − 2s) // n_iter probes
-
-    Quality metric: L1 distance between estimated KDE density and exact density
-    computed from the full d×d Hessian eigendecomposition.
-    """
     print("\n" + "=" * 62)
     print("SLQ vs Deflated SLQ (Hutch++-SLQ) — Spectrum Estimation")
     print("=" * 62)
@@ -307,14 +218,9 @@ def run_slq_experiment(n_runs=8, n_iter=10,
     eye = torch.eye(d)
     H_mat = torch.stack([calc._hessian_vector_product(eye[i]) for i in range(d)], dim=1)
     exact_eigs = np.linalg.eigvalsh(H_mat.numpy())
+    exact_wts  = np.ones(d) / d
 
     lam_min, lam_max = exact_eigs.min(), exact_eigs.max()
-    span = lam_max - lam_min
-    grid  = np.linspace(lam_min - 0.15 * span, lam_max + 0.15 * span, 300)
-    sigma = 0.05 * span
-    dx    = grid[1] - grid[0]
-    exact_density = kde_density(exact_eigs, np.ones(d) / d, grid, sigma)
-
     print(f"\nEigenvalue range: [{lam_min:.3f}, {lam_max:.3f}]  "
           f"(top-5: {sorted(exact_eigs)[-5:][::-1]})\n")
 
@@ -333,8 +239,7 @@ def run_slq_experiment(n_runs=8, n_iter=10,
         for run in range(n_runs):
             torch.manual_seed(run * 13)
             vals, wts = slq_estimate(calc._hessian_vector_product, d, n_v_std, n_iter)
-            density = kde_density(vals, wts, grid, sigma)
-            std_l1.append(np.sum(np.abs(density - exact_density)) * dx)
+            std_l1.append(w1_distance(vals, wts, exact_eigs, exact_wts))
 
         cells = [f"{np.mean(std_l1):.4f}±{np.std(std_l1):.4f}"]
 
@@ -348,9 +253,8 @@ def run_slq_experiment(n_runs=8, n_iter=10,
             def_l1 = []
             for run in range(n_runs):
                 torch.manual_seed(run * 13)
-                l1 = _deflated_slq_l1(calc, d, exact_density, grid, sigma, dx,
-                                      s=s, n_v=n_v_def, n_iter=n_iter)
-                def_l1.append(l1)
+                def_l1.append(_deflated_slq_l1(calc, d, exact_eigs,
+                                               s=s, n_v=n_v_def, n_iter=n_iter))
             cells.append(f"{np.mean(def_l1):.4f}±{np.std(def_l1):.4f}")
 
         print(f"{budget:<8}" + "".join(f"{c:>{col_w}}" for c in cells))
@@ -384,25 +288,8 @@ def make_outlier_bulk_hvp(d, s_true, gap, seed=0):
     return hvp_fn, exact_eigs
 
 
-def run_slq_crossover(d=60, s=5, budget=100, n_iter=5, n_runs=40,
-                      gaps=(1, 2, 5, 10, 20, 50)):
-    """
-    Sweep the spectral gap to find where deflated SLQ outperforms standard SLQ.
-
-    Uses a realistic spectrum: s outlier eigenvalues near `gap` plus a continuous
-    bulk in [0.1, 1.0].  With n_iter small, standard Lanczos wastes steps
-    separating the outliers, while the deflated Lanczos spends all steps on the
-    bulk.  The crossover appears once the gap is large enough that:
-      (a) Q reliably recovers the outlier subspace, AND
-      (b) removing outliers makes the deflated Lanczos significantly cheaper.
-
-    Budget:
-      Standard SLQ  : n_v  = budget // n_iter probes
-      Deflated SLQ  : 2s setup + n_v' = (budget − 2s) // n_iter probes
-    """
-    print("\n" + "=" * 72)
-    print("Crossover Analysis: when does Deflated SLQ beat standard SLQ?")
-    print("=" * 72)
+def run_slq_crossover(d=60, s=5, budget=200, n_iter=20, n_runs=40,
+                      gaps=(10, 20, 50, 100, 200)):
     print(f"\nd={d}, s={s}, budget={budget}, n_iter={n_iter} (intentionally small), n_runs={n_runs}")
     print(f"Spectrum: {s} outliers near `gap`, {d-s} bulk eigenvalues in [0.1, 1.0]\n")
 
@@ -423,13 +310,7 @@ def run_slq_crossover(d=60, s=5, budget=100, n_iter=5, n_runs=40,
         # Trace concentration: fraction of Tr(H) held by the outlier eigenvalues
         conc_pct = 100 * exact_eigs[:s].sum() / exact_eigs.sum()
 
-        # KDE: bandwidth relative to bulk width (not the full range), so the
-        # bulk density is well-resolved regardless of gap size
-        sigma = 0.05 * (exact_eigs[s:].max() - exact_eigs[s:].min() + 1e-6)
-        grid  = np.linspace(-0.2, gap * 1.3, 500)
-        dx    = grid[1] - grid[0]
-        exact_density = kde_density(exact_eigs, np.ones(d) / d, grid, sigma)
-
+        exact_wts = np.ones(d) / d
         std_l1, def_l1 = [], []
 
         for run in range(n_runs):
@@ -437,8 +318,7 @@ def run_slq_crossover(d=60, s=5, budget=100, n_iter=5, n_runs=40,
 
             # ── Standard SLQ ─────────────────────────────────────────
             vals, wts = slq_estimate(hvp_fn, d, n_v_std, n_iter)
-            density = kde_density(vals, wts, grid, sigma)
-            std_l1.append(np.sum(np.abs(density - exact_density)) * dx)
+            std_l1.append(w1_distance(vals, wts, exact_eigs, exact_wts))
 
             # ── Deflated SLQ ──────────────────────────────────────────
             S  = torch.randn(d, s)
@@ -458,8 +338,7 @@ def run_slq_crossover(d=60, s=5, budget=100, n_iter=5, n_runs=40,
                                              deflate_Q=Q)
             all_vals = np.concatenate([large_eigs, slq_vals])
             all_wts  = np.concatenate([np.ones(s) / d, slq_wts * (d - s) / d])
-            density  = kde_density(all_vals, all_wts, grid, sigma)
-            def_l1.append(np.sum(np.abs(density - exact_density)) * dx)
+            def_l1.append(w1_distance(all_vals, all_wts, exact_eigs, exact_wts))
 
         s_mean, s_std = np.mean(std_l1), np.std(std_l1)
         d_mean, d_std = np.mean(def_l1), np.std(def_l1)

@@ -1,7 +1,6 @@
 # Re-exported for backward compatibility. Import from hessian.py or utils.py directly.
 __all__ = [
-    "NNHessianCalculator", "ParamSelector", "compute_eigenvalue",
-    "compute_layer_eigenvalue", "compute_hessians_quantity",
+    "NNHessianCalculator", "ParamSelector",
     "print_gpu_utilization", "add_noise_to_model", "compute_model_norm",
     "load_batch_func", "filter_eigenvalues", "renormalize_weights",
     "construct_spectral_density", "sqrt_with_neg_handling", "get_layers",
@@ -14,9 +13,6 @@ __all__ = [
 from nnhessian.hessian import (
     NNHessianCalculator,
     ParamSelector,
-    compute_eigenvalue,
-    compute_layer_eigenvalue,
-    compute_hessians_quantity,
 )
 from nnhessian.utils import (
     print_gpu_utilization,
