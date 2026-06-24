@@ -1,6 +1,4 @@
-# NNHessian
-
-`NNHessian` is a PyTorch-based utility for estimating the Hessian properties of a neural network model. The goal is to build an interface for utilizing the spectral statistics of Neural Network Hessians to analyze generalization and optimization properties of black-box models such as large language models.
+`nnhessian` is a PyTorch-based utility for estimating the Hessian properties of a neural network model. The goal is to build an interface for utilizing the spectral statistics of Neural Network Hessians to analyze generalization and optimization properties of black-box models such as large language models.
 It supports Hutchinson trace estimation, power iteration for maximum eigenvalue, and other spectral analysis tools.
 This project is currently work in progress.
 
@@ -8,7 +6,7 @@ This project is currently work in progress.
 
 ## Installation
 
-Simply copy the `NNHessian` class into your project or package it into your own library.  
+Simply copy the `nnhessian` class into your project or package it into your own library.  
 Requires:
 
 - Python 3.8+
