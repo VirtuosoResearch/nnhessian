@@ -1,50 +1,4 @@
 """
-Hutch++-style deflated SLQ for the spectral density of the TOP-QUANTILE
-eigenvalues (those above a threshold ``lambda``), and an accuracy comparison
-against standard Stochastic Lanczos Quadrature (SLQ).
-
-Reference
----------
-Meyer, Musco, Musco, Woodruff, "Hutch++: Optimal Stochastic Trace Estimation",
-https://arxiv.org/abs/2010.09649.
-
-Idea
-----
-Standard SLQ estimates the spectral density
-    phi(t) = (1/d) sum_i delta(t - lambda_i)
-from random probe vectors. Its variance is dominated by the few large outlier
-eigenvalues -- which is exactly the part we care about when we want the density
-of the *top quantile* {lambda_i > lambda}.
-
-Hutch++ says to *deflate* that dominant subspace first:
-  1. Sketch  Q = orth(H * Omega)  (optionally refined by subspace iteration) so
-     span(Q) captures the top eigenvectors of H.
-  2. Read off the large eigenvalues *exactly* as the Ritz values of
-     B = Q^T H Q -- each an exact point mass of weight 1/d.
-  3. Run SLQ on the deflated residual  P H P,  P = I - Q Q^T,  to fill in the
-     bulk, contributing total mass (d - s)/d.
-
-The estimated mass above the threshold is then
-    mu_hat(lambda) = (#{Ritz > lambda})/d
-                   + ((d - s)/d) * sum_{nu_k > lambda} w_k,
-and once the sketch captures everything above ``lambda`` the residual term there
-vanishes, so the top-quantile estimate becomes essentially exact and
-low-variance.
-
-This script builds a synthetic symmetric matrix with a *planted* spectrum (so the
-true density above ``lambda`` is known), then compares deflated SLQ vs. standard
-SLQ at matched Hessian-vector-product (HVP) budgets.
-
-Run
----
-    python src/estimate_top_quantile_spectrum.py
-prints an accuracy table and writes, under src/logs/:
-  - top_quantile_density.png        (density profile in the top quantile)
-  - top_quantile_mass_error.png     (mass error vs. HVP budget)
-  - top_quantile_density_data.npz   (arrays to reproduce the density figure)
-  - top_quantile_density_curves.csv (the same curves, plain text)
-
-Reproduce just the density figure from the saved data (no recomputation):
     python src/estimate_top_quantile_spectrum.py \
         --replot_from src/logs/top_quantile_density_data.npz
 """
@@ -60,7 +14,11 @@ import matplotlib.pyplot as plt
 
 from nnhessian.hessian import hutchpp_top_quantile_density, slq_estimate
 from nnhessian.utils import kde_density
-
+import matplotlib as mpl
+from matplotlib import rc
+rc('font',**{'family':'sans-serif','sans-serif':['Helvetica']})
+mpl.rcParams['savefig.dpi'] = 1200
+mpl.rcParams['text.usetex'] = True  # not really needed
 
 # --------------------------------------------------------------------------- #
 # Synthetic Hessian with a known (planted) spectrum                            #
@@ -139,24 +97,30 @@ def draw_density_panel(ax, grid, true_density, slq_curve, dfl_curve, top_eigs,
     region = grid >= lam
     ymax = max(true_density[region].max(), slq_curve[region].max(),
                dfl_curve[region].max())
-    ax.fill_between(grid, true_density, color="0.8", label="true density")
-    ax.plot(grid, slq_curve, color="tab:orange", lw=2, label="Standard SLQ")
-    ax.plot(grid, dfl_curve, color="tab:blue", lw=2, label="Deflated SLQ (Hutch++)")
+    ax.fill_between(grid, true_density, color="0.8", alpha=0.5, label=r"$\mathrm{True~density}$")
+    ax.plot(grid, slq_curve, color="tab:orange", lw=3, ls="dashdot", label=r"$\mathrm{Standard~SLQ}$")
+    ax.plot(grid, dfl_curve, color="tab:blue", lw=2, label=r"$\mathrm{Deflated~SLQ}$")
     ax.axvline(lam, color="k", ls="--", lw=1)
-    ax.plot(top_eigs, np.full_like(top_eigs, -0.03 * ymax), "|", color="k",
-            ms=8, label="true top eigenvalues")
+    eig_heights = np.interp(top_eigs, grid, true_density)
+    ax.vlines(top_eigs, 0.0, eig_heights, color="k", lw=0.6, ls="--", alpha=0.4,
+              zorder=1, label=r"$\mathrm{True~top~eigenvalues}$")
     xmax = (float(top_eigs.max()) if len(top_eigs) else float(grid.max())) + 3
-    ax.set_xlim(lam - 0.5, xmax)
-    ax.set_ylim(-0.06 * ymax, ymax * 1.3)
-    ax.text(lam + 0.2, ymax * 1.12, r"$\lambda$", fontsize=12)
-    ax.set_xlabel("eigenvalue")
-    ax.set_ylabel("spectral density")
-    ax.set_title(f"Top-quantile density (eigenvalues > {lam}, ~{curve_budget} "
-                 f"HVPs, avg of {seeds} seeds)")
-    ax.legend(fontsize=9)
+    ax.set_xlim(lam - 2.00, 63)
+    ax.set_xticks([lam, 20, 40, 60])                    # sparse ticks, keep one at lambda
+    ax.set_xlim(lam - 2.00, 63)                         # set_xticks rescales the view; restore it
+    ax.set_ylim(-0.00005, ymax * 1.3)
+    ax.locator_params(axis="y", nbins=5)               # fewer y ticks
+    ax.text(lam + 1.05, ymax * 1.14, r"$\lambda$", fontsize=26)
+    ax.tick_params(axis="both", labelsize=24)
+    ax.set_xlabel(r"$\mathrm{Eigenvalue}$", fontsize=26)
+    ax.set_ylabel(r"$\mathrm{Spectral~density}$", fontsize=26)
+    #ax.set_title(f"Top-quantile density (eigenvalues > {lam}, ~{curve_budget} "
+    #             f"HVPs, avg of {seeds} seeds)")
+    ax.legend(fontsize=25)
+    ax.grid(True, alpha=0.3)
 
 
-def plot_density_from_data(npz_path, out_png):
+def plot_density_from_data(npz_path, out_pdf):
     """Reproduce the top-quantile density figure purely from a saved *_data.npz.
 
     Demonstrates that the stored data is self-contained for the left figure.
@@ -168,9 +132,10 @@ def plot_density_from_data(npz_path, out_png):
         z["top_eigenvalues"], float(z["lam"]), int(z["curve_budget"]),
         int(z["seeds"]),
     )
-    fig.savefig(out_png, dpi=150)
+    fig.tight_layout()
+    fig.savefig(out_pdf, dpi=150)
     plt.close(fig)
-    return out_png
+    return out_pdf
 
 
 # --------------------------------------------------------------------------- #
@@ -233,9 +198,9 @@ def main():
 
     # Fast path: reproduce the left (density) figure purely from stored data.
     if args.replot_from is not None:
-        out_png = os.path.join(args.outdir, "top_quantile_density.png")
-        plot_density_from_data(args.replot_from, out_png)
-        print(f"Redrew density figure from {args.replot_from} -> {out_png}")
+        out_pdf = os.path.join(args.outdir, "top_quantile_density.pdf")
+        plot_density_from_data(args.replot_from, out_pdf)
+        print(f"Redrew density figure from {args.replot_from} -> {out_pdf}")
         return
 
     torch.set_num_threads(min(8, os.cpu_count() or 1))
@@ -349,7 +314,7 @@ def main():
     fig1, ax1 = plt.subplots(figsize=(7, 5), constrained_layout=True)
     draw_density_panel(ax1, grid, true_density, slq_curve, dfl_curve, top_eigs,
                        args.lam, cb, args.seeds)
-    out_density = os.path.join(args.outdir, "top_quantile_density.png")
+    out_density = os.path.join(args.outdir, "top_quantile_density.pdf")
     fig1.savefig(out_density, dpi=150)
     plt.close(fig1)
     print(f"Saved density figure to {out_density}")
@@ -367,11 +332,10 @@ def main():
     ax2.set_yscale("log")
     ax2.set_xlabel("HVP budget")
     ax2.set_ylabel(r"|estimated $-$ true mass above $\lambda$|")
-    ax2.set_title(f"Top-quantile mass error vs. budget (eigenvalues > {args.lam}, "
-                  f"true mass {true_mass:.3f})")
+    ax2.set_title(f"Top-quantile mass error vs. budget (eigenvalues > {args.lam}, "f"true mass {true_mass:.3f})")
     ax2.grid(True, which="both", alpha=0.3)
     ax2.legend(fontsize=9)
-    out_error = os.path.join(args.outdir, "top_quantile_mass_error.png")
+    out_error = os.path.join(args.outdir, "top_quantile_mass_error.pdf")
     fig2.savefig(out_error, dpi=150)
     plt.close(fig2)
     print(f"Saved mass-error figure to {out_error}")
