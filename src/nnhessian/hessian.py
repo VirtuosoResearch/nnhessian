@@ -11,7 +11,9 @@ from fnmatch import fnmatch
 ParamSelector = Union[str, re.Pattern, Callable[[str, nn.Parameter], bool], nn.Parameter]
 
 
-def lanczos_tridiag(hvp_fn: Callable, v0: torch.Tensor, n_iter: int) -> np.ndarray:
+def lanczos_tridiag(
+    hvp_fn: Callable, v0: torch.Tensor, n_iter: int, reorth: bool = False
+) -> np.ndarray:
     """
     Run n_iter steps of the Lanczos 3-term recurrence starting from unit vector v0.
 
@@ -19,22 +21,36 @@ def lanczos_tridiag(hvp_fn: Callable, v0: torch.Tensor, n_iter: int) -> np.ndarr
         hvp_fn: callable v -> H v (returns a CPU tensor of the same shape as v).
         v0: starting vector (need not be unit-norm).
         n_iter: number of Lanczos steps.
+        reorth: if True, full reorthogonalization of each new Lanczos vector
+                against all previous ones (run twice for numerical stability).
+                Costs O(n_iter^2 * d) but keeps the Ritz values trustworthy at
+                larger n_iter / in low precision; the default (False) keeps the
+                cheap 3-term recurrence used elsewhere.
 
     Returns:
         T: symmetric tridiagonal numpy array of shape (n_iter, n_iter).
     """
     alpha = np.zeros(n_iter)
-    beta  = np.zeros(n_iter - 1)
+    beta  = np.zeros(max(n_iter - 1, 0))
 
+    basis = [] if reorth else None
     v_prev = torch.zeros_like(v0)
     v = v0 / v0.norm()
     b = 0.0
 
     for j in range(n_iter):
+        if reorth:
+            basis.append(v)
         Hv = hvp_fn(v)
         a  = torch.dot(Hv, v).item()
         alpha[j] = a
         r = Hv - a * v - b * v_prev
+
+        if reorth:
+            # Full reorthogonalization (twice) against the stored basis.
+            for _ in range(2):
+                for q in basis:
+                    r = r - q * torch.dot(q, r)
 
         if j < n_iter - 1:
             b = r.norm().item()
@@ -42,9 +58,11 @@ def lanczos_tridiag(hvp_fn: Callable, v0: torch.Tensor, n_iter: int) -> np.ndarr
             if b > 1e-10:
                 v_next = r / b
             else:
-                # Near-happy breakdown: restart orthogonal to current direction
+                # Near-happy breakdown: restart orthogonal to the basis built so far
                 v_next = torch.randn_like(v)
-                v_next = v_next - v * torch.dot(v_next, v)
+                ortho = basis if reorth else [v]
+                for q in ortho:
+                    v_next = v_next - q * torch.dot(q, v_next)
                 nrm = v_next.norm()
                 v_next = v_next / nrm if nrm > 1e-10 else torch.zeros_like(v)
             v_prev, v = v, v_next
@@ -58,6 +76,9 @@ def slq_estimate(
     n_v: int,
     n_iter: int,
     deflate_Q: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.float32,
+    reorth: bool = False,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Stochastic Lanczos Quadrature spectral density estimator.
@@ -70,6 +91,9 @@ def slq_estimate(
         deflate_Q: optional (d, s) orthonormal matrix. When provided each probe
                    is projected out of span(deflate_Q) before running Lanczos,
                    targeting the residual spectrum.
+        dtype: probe dtype (must match what hvp_fn consumes/returns).
+        reorth: full reorthogonalization inside Lanczos (see lanczos_tridiag).
+        generator: optional torch.Generator for reproducible probes.
 
     Returns:
         values:  (n_valid * n_iter,) Ritz values.
@@ -78,7 +102,7 @@ def slq_estimate(
     """
     all_eigs, all_weights = [], []
     for _ in range(n_v):
-        v = torch.randn(d)
+        v = torch.randn(d, dtype=dtype, generator=generator)
         if deflate_Q is not None:
             v = v - deflate_Q @ (deflate_Q.t() @ v)
             nrm = v.norm()
@@ -88,13 +112,149 @@ def slq_estimate(
         else:
             v = v / v.norm()
 
-        T = lanczos_tridiag(hvp_fn, v, n_iter)
+        T = lanczos_tridiag(hvp_fn, v, n_iter, reorth=reorth)
         eigs, U = np.linalg.eigh(T)
         all_eigs.append(eigs)
         all_weights.append(U[0] ** 2)
 
-    n_valid = max(len(all_eigs), 1)
+    if not all_eigs:
+        return np.array([]), np.array([])
+    n_valid = len(all_eigs)
     return np.concatenate(all_eigs), np.concatenate(all_weights) / n_valid
+
+
+def randomized_subspace(
+    hvp_fn: Callable,
+    d: int,
+    rank: int,
+    n_power: int = 0,
+    dtype: torch.dtype = torch.float32,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Randomized sketch of the dominant eigenspace of H (the Hutch++ "Q" step).
+
+    Draws a Gaussian test matrix Omega (d, rank), forms Q = orth(H Omega), and
+    optionally refines it with `n_power` steps of subspace (power) iteration so
+    Q better captures the top eigenvectors of H.
+
+    Args:
+        hvp_fn: callable v -> H v.
+        d: dimension.
+        rank: sketch size s (number of columns of Q).
+        n_power: subspace-iteration steps (0 = plain Hutch++ sketch).
+        dtype: working dtype.
+        generator: optional torch.Generator for reproducibility.
+
+    Returns:
+        Q:  (d, rank) orthonormal basis approximating the top-rank eigenspace.
+        HQ: (d, rank) equal to H @ Q.
+        B:  (rank, rank) symmetric matrix Q^T H Q whose eigenvalues are the
+            Ritz approximations of the top eigenvalues of H.
+
+    HVP cost: rank * (2 + n_power).
+    """
+    def matmat(M: torch.Tensor) -> torch.Tensor:
+        return torch.stack([hvp_fn(M[:, i].contiguous()) for i in range(M.shape[1])], dim=1)
+
+    Omega = torch.randn(d, rank, dtype=dtype, generator=generator)
+    Y = matmat(Omega)
+    for _ in range(n_power):
+        Q, _ = torch.linalg.qr(Y, mode="reduced")
+        Y = matmat(Q)
+    Q, _ = torch.linalg.qr(Y, mode="reduced")
+    HQ = matmat(Q)
+    B = Q.t() @ HQ
+    B = 0.5 * (B + B.t())
+    return Q, HQ, B
+
+
+def hutchpp_top_quantile_density(
+    hvp_fn: Callable,
+    d: int,
+    lam: float,
+    sketch_rank: int,
+    n_v: int,
+    n_iter: int,
+    n_power: int = 1,
+    dtype: torch.dtype = torch.float64,
+    reorth: bool = True,
+    generator: Optional[torch.Generator] = None,
+) -> dict:
+    """
+    Hutch++-style estimator of the spectral density restricted to the TOP
+    QUANTILE -- the eigenvalues above a threshold ``lam``.
+
+    Based on Hutch++ (Meyer, Musco, Musco, Woodruff, arXiv:2010.09649): deflate
+    the dominant eigenspace with a randomized sketch, resolve the large
+    eigenvalues *exactly* as the Ritz values of B = Q^T H Q (each an exact point
+    mass of weight 1/d), then run SLQ only on the deflated residual
+    ``P H P`` with ``P = I - Q Q^T`` to fill in the rest of the density.
+
+    The combined spectral density estimate is
+        phi_hat(t) = (1/d) sum_j delta(t - theta_j)            [exact top part]
+                   + ((d - s)/d) sum_k w_k delta(t - nu_k)     [residual SLQ]
+    and the top-quantile mass (fraction of eigenvalues above ``lam``) is
+        mu_hat(lam) = (#{theta_j > lam})/d
+                    + ((d - s)/d) sum_{nu_k > lam} w_k.
+    Because the sketch captures the eigenvalues above ``lam`` whenever
+    ``s`` exceeds their count, the residual term there vanishes and the
+    top-quantile estimate becomes essentially exact and low-variance -- unlike
+    plain SLQ, whose variance is dominated by exactly these few large outliers.
+
+    Args:
+        hvp_fn: callable v -> H v (1-D tensor in/out, dtype == ``dtype``).
+        d: dimension.
+        lam: threshold; the "top quantile" is {eigenvalue > lam}.
+        sketch_rank: deflation rank s.
+        n_v: residual SLQ probe count.
+        n_iter: residual SLQ Lanczos steps.
+        n_power: subspace-iteration steps for the sketch (default 1).
+        dtype: working dtype (float64 recommended for accurate Ritz values).
+        reorth: full reorthogonalization inside residual Lanczos.
+        generator: optional torch.Generator for reproducibility.
+
+    Returns:
+        dict with keys:
+          values, weights        -- full combined density (weights sum to ~1)
+          ritz_vals              -- the s exact top Ritz values
+          residual_values/weights-- residual SLQ part (weights already scaled)
+          mass_above             -- estimated fraction of eigenvalues > lam
+          top_mass_above         -- contribution from the exact top part only
+          n_hvp                  -- total Hessian-vector products used
+    """
+    Q, HQ, B = randomized_subspace(hvp_fn, d, sketch_rank, n_power, dtype, generator)
+    ritz_vals = np.linalg.eigvalsh(B.cpu().numpy().astype(np.float64))
+
+    def deflated_hvp(v, _Q=Q, _HQ=HQ, _B=B):
+        # (I - QQ^T) H (I - QQ^T) v  without ever forming H.
+        Hv = hvp_fn(v)
+        Qtv = _Q.t() @ v
+        QtHv = _Q.t() @ Hv
+        return Hv - _HQ @ Qtv - _Q @ QtHv + _Q @ (_B @ Qtv)
+
+    res_vals, res_wts = slq_estimate(
+        deflated_hvp, d, n_v, n_iter, deflate_Q=Q,
+        dtype=dtype, reorth=reorth, generator=generator,
+    )
+
+    s = sketch_rank
+    top_wts = np.full(s, 1.0 / d)
+    res_wts_scaled = res_wts * (d - s) / d
+
+    values = np.concatenate([ritz_vals, res_vals])
+    weights = np.concatenate([top_wts, res_wts_scaled])
+
+    return {
+        "values": values,
+        "weights": weights,
+        "ritz_vals": ritz_vals,
+        "residual_values": res_vals,
+        "residual_weights": res_wts_scaled,
+        "mass_above": float(weights[values > lam].sum()),
+        "top_mass_above": float(top_wts[ritz_vals > lam].sum()),
+        "n_hvp": s * (2 + n_power) + n_v * n_iter,
+    }
 
 
 class NNHessianCalculator():
@@ -447,6 +607,33 @@ class NNHessianCalculator():
         all_vals = np.concatenate([large_eigs, slq_vals])
         all_wts  = np.concatenate([np.ones(s) / d, slq_wts * (d - s) / d])
         return all_vals, all_wts
+
+    def hutchpp_top_quantile_spectrum(
+        self, lam: float, sketch_rank: int, n_v: int, n_iter: int,
+        n_power: int = 1, dataloader=None,
+    ) -> dict:
+        """
+        Hutch++-style spectral density of the top-quantile eigenvalues (> lam).
+
+        Thin wrapper around :func:`hutchpp_top_quantile_density` using this
+        model's Hessian-vector product. Runs in the model's parameter dtype
+        (typically float32) without Lanczos reorthogonalization, matching the
+        rest of this class; see the standalone function for the algorithm.
+        """
+        if dataloader is None:
+            if self.dataloader is None:
+                raise ValueError("No dataloader provided.")
+            dataloader = self.dataloader
+
+        params = list(self.named_params.values()) if self.named_params else \
+            [p for p in self.model.parameters() if p.requires_grad]
+        p_dtype = params[0].dtype
+
+        hvp_fn = lambda v: self._hessian_vector_product(v, dataloader=dataloader)
+        return hutchpp_top_quantile_density(
+            hvp_fn, self.total_params, lam, sketch_rank, n_v, n_iter,
+            n_power=n_power, dtype=p_dtype, reorth=False,
+        )
 
     def max_eigenvalue_power(self, num_iters: int = 50, tol: float = 1e-5,
                          dataloader=None, init_vec: torch.Tensor = None,
